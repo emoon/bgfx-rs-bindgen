@@ -1,6 +1,9 @@
 use bgfx_idl::*;
-use std::borrow::Cow;
 use convert_case::{Case, Casing};
+use std::borrow::Cow;
+
+// list of functions to skip that are manually implemented
+static SKIP_FUNCS: &[&str] = &["getShaderUniforms"];
 /*
 struct VertexLayout {
     data: bgfx::bgfx_vertex_layout_s;
@@ -78,7 +81,10 @@ fn get_rust_array(type_name: &str, count: &str, idl: &Idl) -> String {
         if let Ok(v) = count.parse::<usize>() {
             value_count = v;
         } else {
-            panic!("Unable to figure out array count for {}:{}", type_name, count);
+            panic!(
+                "Unable to figure out array count for {}:{}",
+                type_name, count
+            );
         }
     }
 
@@ -93,10 +99,10 @@ fn get_rust_array(type_name: &str, count: &str, idl: &Idl) -> String {
     // otherwise we need
 }
 
-fn get_rust_type(s: &Type, idl: &Idl) -> String {
+fn get_rust_type(s: &Type, idl: &Idl, is_arg: bool) -> String {
     let mut output_type = String::new();
 
-    if s.is_ref {
+    if s.is_ref || (s.is_pointer && is_arg) {
         output_type.push('&')
     } else if s.is_pointer {
         output_type.push('*');
@@ -114,17 +120,17 @@ fn get_rust_type(s: &Type, idl: &Idl) -> String {
         VarType::Primitive(name) => {
             output_type.push_str(get_rust_primitive_type(&name).unwrap());
             output_type
-        },
+        }
 
         VarType::Struct(name) => {
             output_type.push_str(&name);
             output_type
-        },
+        }
 
         VarType::Enum(name) => {
             output_type.push_str(&name);
             output_type
-        },
+        }
 
         VarType::Array(type_name, count) => get_rust_array(&type_name, &count, idl),
 
@@ -140,15 +146,91 @@ fn generate_struct(s: &Func, idl: &Idl) {
 
     for e in &s.args {
         generate_rust_comment(&e.name_line.comment, 4);
-        println!("    {}: {},", e.name_line.text.to_case(Case::Snake), get_rust_type(&e.arg_type, idl));
+        println!(
+            "    {}: {},",
+            e.name_line.text.to_case(Case::Snake),
+            get_rust_type(&e.arg_type, idl, false)
+        );
     }
 
     println!("}}");
 }
 
-fn generate_impl_func(f: &Func, idl: &Idl) {
-    let mut func_name = f.name.text.to_case(Case::Snake);
+/// Some functions are of type setName (handle, ptr, len) and we special case those
+/// as we can use &str directly then given than len is supported as input.
+/// Returns true if setName function was generated, otherwise false
+fn generate_set_name_func(f: &Func, real_name: &str) -> bool {
+    if f.name.text != "setName" {
+        return false;
+    }
 
+    let handle_type = &f.args[0].type_name;
+
+    println!("    pub fn {}(&self, name: &str) {{", real_name);
+    println!(
+        "        unsafe {{ bgfx_sys::{}(self.handle, name.ptr(), name.len() as i32) }}",
+        real_name
+    );
+    println!("    }}");
+
+    true
+}
+
+/// Select how to generate the function
+#[derive(PartialEq)]
+enum FunctionMode {
+    Method,
+    Global,
+    Handle,
+}
+
+fn get_snake_name(name: &str) -> String {
+    let mut name = name.to_case(Case::Snake);
+    // special case: 2D gets translated to 2_d and we want 2d
+
+    let len = name.len();
+    let mut remove_incorrect_space = false;
+
+    if name.len() >= 3 {
+        let bytes = name.as_bytes();
+        let nr = bytes[len - 3];
+        if (nr >= b'0') && (nr < b'9') {
+            remove_incorrect_space = true;
+        }
+    }
+
+    if remove_incorrect_space {
+        name.remove(len - 2);
+    }
+
+    name
+}
+
+fn get_ffi_call_name(f: &Func) -> String {
+    let mut name = String::with_capacity(256);
+
+    name.push_str("bgfx_");
+    name.push_str(&f.class.text);
+    name.push_str(&f.name.text);
+
+    get_snake_name(&name)
+}
+
+/// General function implementation
+fn generate_func(f: &Func, idl: &Idl, func_mode: FunctionMode) {
+    // if function has been marked for skipping we skip it
+    if SKIP_FUNCS.iter().find(|n| *n == &f.name.text).is_some() {
+        return;
+    }
+
+    let mut func_name = get_snake_name(&f.name.text);
+    let indent_level = match func_mode {
+        FunctionMode::Method => 4,
+        FunctionMode::Handle => 4,
+        FunctionMode::Global => 0,
+    };
+
+    // find the replacement name
     for t in &f.table {
         if t.name == "cname" {
             func_name = t.str_data.to_owned();
@@ -156,26 +238,82 @@ fn generate_impl_func(f: &Func, idl: &Idl) {
         }
     }
 
-    generate_rust_comment(&f.comments, 4);
-    print!("    pub fn {}(&self", func_name);
+    generate_rust_comment(&f.comments, indent_level);
 
-    for arg in &f.args {
-        print!(", {}: {}", arg.name_line.text.to_case(Case::Snake), get_rust_type(&arg.arg_type, idl))
+    // generate check name function if it is one
+    if generate_set_name_func(f, &func_name) {
+        return;
+    }
+
+    let arg_count = f.args.len();
+
+    match func_mode {
+        FunctionMode::Method => {
+            if arg_count == 0 {
+                print!("    pub fn {}(&self", func_name);
+            } else {
+                print!("    pub fn {}(&self, ", func_name);
+            }
+        }
+
+        FunctionMode::Global => print!("pub fn {}(", func_name),
+        _ => (),
+    }
+
+    let ffi_name = get_ffi_call_name(f);
+
+    let mut call_args = String::with_capacity(256);
+
+    if func_mode == FunctionMode::Handle {
+        if arg_count <= 1 {
+            print!("    pub fn {}(&self", func_name);
+            call_args.push_str("self.handle");
+        } else {
+            print!("    pub fn {}(&self, ", func_name);
+            call_args.push_str("self.handle, ");
+        }
+    }
+
+    for (i, arg) in f.args.iter().enumerate() {
+        // skip first arg in Handle mode
+        if func_mode == FunctionMode::Handle && i == 0 {
+            continue;
+        }
+        let arg_name = arg.name_line.text.to_case(Case::Snake);
+        if i == arg_count - 1 {
+            call_args.push_str(&arg_name);
+            print!("{}: {}", arg_name, get_rust_type(&arg.arg_type, idl, true))
+        } else {
+            call_args.push_str(&arg_name);
+            call_args.push_str(", ");
+            print!("{}: {}, ", arg_name, get_rust_type(&arg.arg_type, idl, true))
+        }
     }
 
     println!(") {{");
 
-    print!("      unsafe {{ bgfx_sys::bgfx_{}(self as *const void", func_name);
+    match func_mode {
+        FunctionMode::Method => {
+            println!(
+                "       {{ bgfx_sys::{}(self as *const c_void, {}) }}",
+                ffi_name, call_args
+            );
+            println!("    }}\n");
+        }
 
-    for arg in &f.args {
-        print!(", {}", arg.name_line.text.to_case(Case::Snake));
+        FunctionMode::Handle => {
+            println!("       {{ bgfx_sys::{}({}) }}", ffi_name, call_args);
+            println!("    }}\n");
+        }
+
+        FunctionMode::Global => {
+            println!(
+                "    unsafe {{ bgfx_sys::{}({}) }}",
+                ffi_name, call_args
+            );
+            println!("}}\n");
+        }
     }
-
-    println!(")  }}\n");
-
-    println!("    }}\n");
-
-    // TODO: generate call to bgfx C code
 }
 
 fn generate_funcs_for_struct(name: &str, idl: &Idl) {
@@ -188,101 +326,134 @@ fn generate_funcs_for_struct(name: &str, idl: &Idl) {
 
     for f in &idl.funcs {
         if f.class.text == name {
-            generate_impl_func(f, idl);
+            generate_func(f, idl, FunctionMode::Method);
         }
     }
 
     println!("}}\n");
 }
 
-fn generate_global_func(f: &Func, idl: &Idl) {
-    generate_rust_comment(&f.comments, 0);
+fn generate_handles(h: &Typedef) {
+    // Generate the handle and also generate the wrapper struct that is used in user code
+    println!("#[derive(Copy, Clone, Debug)]");
+    println!("struct {} {{ ", h.type_line.text);
+    println!("    idx: u16,");
+    println!("}}\n");
 
-    let mut func_name = f.name.text.to_case(Case::Snake);
+    let len = h.type_line.text.len() - 6;
 
-    for t in &f.table {
-        if t.name == "cname" {
-            func_name = t.str_data.to_owned();
-            break;
-        }
-    }
-
-    print!("pub fn {}(", func_name);
-
-    let arg_count = f.args.len();
-    let mut call_args = String::new();
-
-    for (i, arg) in f.args.iter().enumerate() {
-        let arg_name = arg.name_line.text.to_case(Case::Snake);
-        if i == arg_count - 1 {
-            call_args.push_str(&arg_name);
-            print!("{}: {}", arg_name, get_rust_type(&arg.arg_type, idl))
-        } else {
-            call_args.push_str(&arg_name);
-            call_args.push_str(", ");
-            print!("{}: {}, ", arg_name, get_rust_type(&arg.arg_type, idl))
-        }
-    }
-
-    println!(") {{");
-
-    println!("    unsafe {{ bgfx_sys::bgfx_{}({}) }}", func_name, call_args);
+    println!("#[derive(Copy, Clone, Debug)]");
+    println!("pub struct {} {{ ", &h.type_line.text[..len]);
+    println!("    handle: {},", h.type_line.text);
     println!("}}\n");
 }
 
+// generates implementations for the handle structs
+fn generate_handle_impl(idl: &Idl) {
+    for h in &idl.handles {
+        let h_type = &h.type_line.text;
+        let len = h_type.len() - 6;
+
+        println!("impl {} {{ ", &h_type[..len]);
+
+        // find matching handle name for the first argument
+        for f in &idl.funcs {
+            if !f.class.text.is_empty() {
+                continue;
+            }
+
+            if (!f.args.is_empty() && &f.args[0].type_name == h_type) || &f.return_name_line.text == h_type {
+                generate_func(f, idl, FunctionMode::Handle);
+            }
+        }
+
+        println!("}}\n");
+    }
+}
 
 fn main() {
     let data = bgfx_idl::parse_bgfx_idl("/home/emoon/temp/foo.idl").unwrap();
 
-    for s in &data.structs {
-        //if s.name.text == "VertexLayout" {
-            generate_struct(&s, &data);
-        //}
+    /*
+    for f in &data.funcs {
+        if f.return_type.is_pointer {
+            println!("{} -> {}", f.name.text, f.return_name_line.text);
+        }
+    }
+    */
+
+    for h in &data.handles {
+        generate_handles(&h);
     }
 
     for s in &data.structs {
+        generate_struct(&s, &data);
+    }
+
+    generate_handle_impl(&data);
+
+    for s in &data.structs {
         generate_funcs_for_struct(&s.name.text, &data);
-        //if s.name.text == "VertexLayout" {
-            //generate_struct(&s, &data);
-        //}
     }
 
     for f in &data.funcs {
         if f.class.text.is_empty() {
-            generate_global_func(&f, &data);
+            generate_func(&f, &data, FunctionMode::Global);
         }
     }
+
+
+    println!("{}", MANUAL_IMPL);
 
     //generate_funcs_for_struct("VertexLayout", &data);
 }
 
-/*
-struct VertexLayout {
-    data: bgfx::bgfx_vertex_layout_s;
+// for various reasons here is a list of manual implementations for some functions
+static MANUAL_IMPL: &str = "
+/// Returns the number of uniforms and uniform handles used inside a shader.
+///
+/// Notice that only non-predefined uniforms are returned.
+pub fn get_shader_uniforms(handle: ShaderHandle, uniforms: &mut [UniformHandle]) -> u16 {
+    unsafe { bgfx_sys::bgfx_get_shader_uniforms(handle, uniforms.as_ptr(), uniforms.len() as u16) }
 }
 
-impl VertexLayout {
-    pub fn new() -> VertexLayout {
-        VertexLayout { data: bgfx::bgfx_vertex_layout_s::default(); }
+/// bgfx-managed buffer of memory.
+///
+/// It can be created by either copying existing data through [`copy(...)`], or by referencing
+/// existing memory directly through [`reference(...)`].
+///
+/// [`copy(...)`]: #method.copy
+/// [`reference(...)`]: #method.reference
+pub struct Memory {
+    data: *const bgfx_sys::bgfx_memory_t,
+}
+
+impl Memory {
+    /// Copies the source data into a new bgfx-managed buffer.
+    ///
+    /// **IMPORTANT:** If this buffer is never passed into a bgfx call, the memory will never be
+    /// freed, and will leak.
+    #[inline]
+    pub fn copy<T>(data: &[T]) -> Memory {
+        unsafe {
+            let data = bgfx_sys::bgfx_copy(data.as_ptr() as *const c_void,
+                                           mem::size_of_val(data) as u32);
+            Memory { data }
+        }
     }
 
-    pub fn begin(&self, render_type: RenderType) -> &self {
-        unsafe { bgfx_vertex_layout_begin(self.data as *const void, render_type);
-        self
-    }
-
-    pub fn add(attrib: Attrib, num: u8, type: AttribType, normalized: bool, as_int: bool) -> &self {
-        unsafe { bgfx_vertex_layout_add(self.data as *const void, render_type);
-    }
-
-    pub fn has(attrib: Attrib) -> bool {
-        unsafe { bgfx_vertex_layout_has(self.data as *const void) }
-    }
-
-    pub fn add(attrib: Attrib, num: u8, type: AttribType, normalized: bool, as_int: bool) -> &self {
-        unsafe { bgfx_vertex_layout_add(self.data as *const void, render_type);
+    /// Creates a reference to the source data for passing into bgfx. When using this constructor
+    /// over the `copy` call, no copy will be created. bgfx will read the source memory directly.
+    ///
+    /// *Note* That the data passed to this function must be keep alive during the whole duration
+    /// of the program and is only really recommended for static data unless you know you know
+    /// what you are doing. Thus this function is marked as unsafe because of this reason.
+    #[inline]
+    pub fn unsafe reference<T>(data: &[T]) -> Memory {
+        let data = bgfx_sys::bgfx_make_ref(data.as_ptr() as *const c_void,
+                                           mem::size_of_val(data) as u32);
+        Memory { data }
     }
 }
-*/
 
-
+";
