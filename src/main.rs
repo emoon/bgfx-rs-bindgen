@@ -1,44 +1,58 @@
 use bgfx_idl::*;
 use convert_case::{Case, Casing};
-use std::borrow::Cow;
+use std::collections::HashMap;
 
 // list of functions to skip that are manually implemented
 static SKIP_FUNCS: &[&str] = &["getShaderUniforms"];
-/*
-struct VertexLayout {
-    data: bgfx::bgfx_vertex_layout_s;
+
+fn generate_rust_comment(text: &str) {
+    text.lines().for_each(|l| println!("///{}", l));
 }
 
-impl VertexLayout {
-    pub fn new() -> VertexLayout {
-        VertexLayout { data: bgfx::bgfx_vertex_layout_s::default(); }
+/// Get default value for a table
+fn get_default_arg(table: &Vec<TableEntry>) -> Option<String> {
+    for t in table {
+        if t.name == "default" {
+            if !t.str_data.is_empty() {
+                match t.str_data.as_str() {
+                    "UINT8_MAX" => return Some("std::u8::MAX".to_owned()),
+                    "UINT16_MAX" => return Some("std::u16::MAX".to_owned()),
+                    "INT32_MAX" => return Some("std::i32::MAX".to_owned()),
+                    "NULL" => return Some("None".to_owned()),
+                    "false" => return Some("false".to_owned()),
+                    "true" => return Some("true".to_owned()),
+                    _ => (),
+                }
+
+                return Some(t.str_data.to_owned());
+            } else {
+                return Some(t.num.unwrap().to_string());
+            }
+        }
     }
 
-    pub fn begin(&self, render_type: RenderType) -> &self {
-        unsafe { bgfx_vertex_layout_begin(self.data as *const void, render_type);
-        self
-    }
-
-    pub fn add(attrib: Attrib, num: u8, type: AttribType, normalized: bool, as_int: bool) -> &self {
-        unsafe { bgfx_vertex_layout_add(self.data as *const void, render_type);
-    }
-
-    pub fn has(attrib: Attrib) -> bool {
-        unsafe { bgfx_vertex_layout_has(self.data as *const void) }
-    }
-
-    pub fn add(attrib: Attrib, num: u8, type: AttribType, normalized: bool, as_int: bool) -> &self {
-        unsafe { bgfx_vertex_layout_add(self.data as *const void, render_type);
-    }
+    None
 }
-*/
 
-fn generate_rust_comment(text: &str, indent_level: usize) {
-    let lines = text.lines();
+/// Count the number of default arguments exists in a function
+fn count_default_angs(f: &Func) -> u32 {
+    f.args
+        .iter()
+        .map(|a| { if get_default_arg(&a.table).is_some() { 1u32 } else { 0u32 } })
+        .sum::<u32>()
+}
 
-    for line in lines {
-        println!("{:indent$}/// {}", "", line, indent = indent_level);
-    }
+/// Get the name of a function
+fn get_func_name(f: &Func) -> String {
+    let mut func_name = get_snake_name(&f.name.text);
+
+    // if we have a replacement name
+    f.table
+        .iter()
+        .find(|&t| t.name == "cname")
+        .map(|t| func_name = t.str_data.to_owned());
+
+    func_name
 }
 
 // look for an enum by name and get how many entries it has. This code
@@ -60,11 +74,11 @@ fn get_rust_primitive_type(s: &str) -> Option<&'static str> {
         "uint8_t" => Some("u8"),
         "uint16_t" => Some("u16"),
         "uint32_t" => Some("u32"),
-        "uint64_t" => Some("u32"),
-        "int8_t" => Some("s8"),
-        "int16_t" => Some("s16"),
-        "int32_t" => Some("s32"),
-        "int64_t" => Some("s32"),
+        "uint64_t" => Some("u64"),
+        "int8_t" => Some("i8"),
+        "int16_t" => Some("i16"),
+        "int32_t" => Some("i32"),
+        "int64_t" => Some("i64"),
         "float" => Some("f32"),
         "void" => Some("std::os::raw::c_void"),
         _ => None,
@@ -139,13 +153,13 @@ fn get_rust_type(s: &Type, idl: &Idl, is_arg: bool) -> String {
 }
 
 fn generate_struct(s: &Func, idl: &Idl) {
-    generate_rust_comment(&s.comments, 0);
+    generate_rust_comment(&s.comments);
 
     println!("#[repr(C)]");
     println!("struct {} {{", s.name.text);
 
     for e in &s.args {
-        generate_rust_comment(&e.name_line.comment, 4);
+        generate_rust_comment(&e.name_line.comment);
         println!(
             "    {}: {},",
             e.name_line.text.to_case(Case::Snake),
@@ -177,7 +191,7 @@ fn generate_set_name_func(f: &Func, real_name: &str) -> bool {
 }
 
 /// Select how to generate the function
-#[derive(PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 enum FunctionMode {
     Method,
     Global,
@@ -216,6 +230,266 @@ fn get_ffi_call_name(f: &Func) -> String {
     get_snake_name(&name)
 }
 
+/// Rules for input parameter translation
+///
+/// bool/uint16_t/uint32_t/etc -> bool/u16/u32/etc, can pass directly to ffi func
+///
+/// ----------------------------------------------------------------------------
+/// input: .format "TextureFormat::Enum"
+///
+/// args:      format: TextureFormat
+/// body:
+/// ffi call:  format.bits()
+/// ----------------------------------------------------------------------------
+/// input: .mem "const Memory*"
+///
+/// args:      format: &Memory
+/// body:
+/// ffi call:  format.handle
+/// ----------------------------------------------------------------------------
+/// input: .mem "const Memory*" { default = NULL }
+/// args:      format: Optional<&Memory>
+/// body:      let _mem = if let Some(f) = format { f.handle } else { null() };
+/// ffi call:  _mem
+/// ----------------------------------------------------------------------------
+/// input: .flags "uint64_t" { default = "BGFX_TEXTURE_NONE|BGFX_SAMPLER_NONE" }
+/// args:      flags: u64
+/// body:      let _flags = TextureFlags::NONE.bits() | SamplerFlags::NONE.bits();
+/// ffi call:  flags
+/// ----------------------------------------------------------------------------
+/// input: .handle "Texture<*>"
+/// args:      &self
+/// ffi call:  self.handle
+/// ----------------------------------------------------------------------------
+/// input: .name "const char*", .len
+/// args:      name: &str
+/// ffi call:  name.as_ptr(), name.len() as i32
+///
+/// ----------------------------------------------------------------------------
+/// input: .name "const char*", .len
+/// args:      name: &str
+/// ffi call:  name.as_ptr(), name.len() as i32
+///
+/// ----------------------------------------------------------------------------
+/// input: .data "void*"
+/// pre_f      <X: Sized>
+/// args:      data: &mut [T]
+/// ffi call:  data.as_ptr()
+/// ----------------------------------------------------------------------------
+/// input: .data "const void*"
+/// pre_f      <X: Sized>
+/// args:      data: &[T]
+/// ffi call:  data.as_ptr()
+/// ----------------------------------------------------------------------------
+/// input: .data "float[4]" { out }
+/// args:      data: &mut [f32; 4]
+/// ffi call:  data.as_ptr()
+/// ----------------------------------------------------------------------------
+/// input: .data "const float[4]"
+/// args:      data: &[f32; 4]
+/// ffi call:  data.as_ptr()
+/// ----------------------------------------------------------------------------
+/// input: .layout "const VertexLayout&"
+/// args:      layout: &VertexLayout
+/// ffi call:  layout.handle
+/// ----------------------------------------------------------------------------
+/// input: .name "const char*"
+/// args:      name: &str
+/// body:      let _name = CStrWrapper(name).unwrap();
+/// ffi call:  _name.as_ptr()
+
+/// Return values
+///
+/// ----------------------------------------------------------------------------
+/// input:    void*
+/// ret:      -> c_void
+/// mark call unsafe
+/// ffi call:
+/// ----------------------------------------------------------------------------
+/// input:    VertexLayout&
+/// ret:      -> Self
+/// ----------------------------------------------------------------------------
+/// input:    "const Stats*"
+/// ret:      -> Option<&'static Stats>
+/// body:     ffi_call(...).as_ref()
+/// ----------------------------------------------------------------------------
+/// input:    "RenderType::Enum"
+/// ret:      -> RenderType
+/// body:     RenderType::from_bits(ffi_call(...))
+
+#[derive(Default)]
+struct FuncArgs {
+    func_args: Vec<String>,
+    ffi_args: Vec<String>,
+    body: String,
+}
+
+/// Generate the function setup when there are default arguments
+fn generate_func_default_args(
+    fa: &mut FuncArgs,
+    f: &Func,
+    start: usize,
+    func_name: &str,
+    _idl: &Idl,
+) {
+    // Setup the args with is the collection of the default arguments inside a struct
+    fa.func_args.push(format!(
+        "params: {}Args",
+        func_name.to_case(Case::UpperCamel)
+    ));
+
+    for arg in f.args.iter().skip(start) {
+        let arg_name = arg.name_line.text.to_case(Case::Snake);
+
+        let is_none = get_default_arg(&arg.table).map(|t| t == "None").is_some();
+        let s = &arg.arg_type;
+
+        match &s.var_type {
+            VarType::Primitive(_name) => {
+                fa.ffi_args.push(format!("params.{}", arg_name.to_owned()));
+            }
+
+            VarType::Struct(_name) => {
+                if is_none {
+                    fa.body.push_str(&format!("let _{} = if let Some(h) = params.{} {{ h.handle }} else {{ std::ptr::null() }};", arg_name, arg_name));
+                    fa.ffi_args.push(format!("_{}", arg_name));
+                } else {
+                    fa.ffi_args.push(format!("params.{}", arg_name));
+                }
+            }
+
+            VarType::Enum(_name) => {
+                // TODO: Support inout?
+                fa.ffi_args.push(format!("params.{}.bits()", arg_name));
+            }
+
+            VarType::Array(_type_name, _count) => {
+                fa.ffi_args.push(format!("params.{}", arg_name));
+            }
+
+            _ => panic!("Unable to figure out Rust type for {:#?}", s),
+        }
+    }
+}
+
+/// Constructs the arguments and body for a ffi function call
+/// Returns func_args, body and args for ffi function
+fn get_func_call_args(f: &Func, func_name: &str, idl: &Idl, func_mode: FunctionMode) -> FuncArgs {
+    let mut fa = FuncArgs::default();
+
+    // skip first arg in Handle mode
+    let skip = if func_mode == FunctionMode::Handle {
+        1
+    } else {
+        0
+    };
+
+    let arg_count = count_default_angs(f);
+
+    for (i, arg) in f.args.iter().skip(skip).enumerate() {
+        // check if the arg is default null
+        if arg_count >= 2 && arg.table.iter().find(|x| x.name == "default").is_some() {
+            generate_func_default_args(&mut fa, f, i, func_name, idl);
+            return fa;
+        }
+
+        let arg_name = arg.name_line.text.to_case(Case::Snake);
+        let s = &arg.arg_type;
+
+        let mut output_type = String::new();
+        let mut ffi_arg = arg_name.clone();
+
+        if s.is_pointer || s.is_ref {
+            output_type.push('&')
+        }
+
+        if s.is_output {
+            output_type.push_str("mut ");
+        }
+
+        match &s.var_type {
+            VarType::Primitive(name) => {
+                output_type.push_str(get_rust_primitive_type(&name).unwrap());
+            }
+
+            VarType::Struct(name) => {
+                // Translate *Handle to *
+                if let Some((handle_name, _)) = name.rsplit_once("Handle") {
+                    output_type.push_str(handle_name);
+                    ffi_arg.push_str(".handle");
+                } else {
+                    output_type.push_str(&name);
+                }
+            }
+
+            VarType::Enum(name) => {
+                output_type.push_str(&name);
+                ffi_arg.push_str(".bits()");
+            }
+
+            VarType::Array(type_name, count) => {
+                output_type.push_str(&get_rust_array(&type_name, &count, idl));
+            }
+
+            _ => panic!("Unable to figure out Rust type for {:#?}", s),
+        }
+
+        fa.ffi_args.push(ffi_arg);
+        fa.func_args.push(format!("{}: {}", arg_name, output_type));
+    }
+
+    fa
+}
+
+fn print_args(args: &Vec<String>) {
+    let len = args.len();
+    for (i, v) in args.iter().enumerate() {
+        if i == len - 1 {
+            print!("{}", v)
+        } else {
+            print!("{}, ", v)
+        }
+    }
+}
+
+/// Generate default parameter struct
+fn generate_default_params(f: &Func, name: &str, idl: &Idl) {
+    let name = format!("{}Args", name.to_case(Case::UpperCamel));
+
+    println!("struct {} {{", name);
+
+    let mut default_args = Vec::new();
+
+    for e in &f.args {
+        // get the default argument
+        if let Some(da) = get_default_arg(&e.table) {
+            generate_rust_comment(&e.name_line.comment);
+            let arg_name = e.name_line.text.to_case(Case::Snake);
+            let rust_type = get_rust_type(&e.arg_type, idl, true);
+
+            if da == "None" {
+                println!("pub {}: Option<{}>,", arg_name, rust_type);
+            } else {
+                println!("pub {}: {},", arg_name, rust_type);
+            }
+
+            default_args.push((arg_name, da));
+        }
+    }
+
+    println!("}}\n");
+
+    println!("impl Default for {} {{", name);
+    println!("fn default() -> {} {{", name);
+    println!("{} {{", name);
+
+    for a in default_args {
+        println!("{}: {},", a.0, a.1);
+    }
+
+    println!("}}}}}}\n");
+}
+
 /// General function implementation
 fn generate_func(f: &Func, idl: &Idl, func_mode: FunctionMode) {
     // if function has been marked for skipping we skip it
@@ -223,22 +497,9 @@ fn generate_func(f: &Func, idl: &Idl, func_mode: FunctionMode) {
         return;
     }
 
-    let mut func_name = get_snake_name(&f.name.text);
-    let indent_level = match func_mode {
-        FunctionMode::Method => 4,
-        FunctionMode::Handle => 4,
-        FunctionMode::Global => 0,
-    };
+    let func_name = get_func_name(f);
 
-    // find the replacement name
-    for t in &f.table {
-        if t.name == "cname" {
-            func_name = t.str_data.to_owned();
-            break;
-        }
-    }
-
-    generate_rust_comment(&f.comments, indent_level);
+    generate_rust_comment(&f.comments);
 
     // generate check name function if it is one
     if generate_set_name_func(f, &func_name) {
@@ -274,46 +535,18 @@ fn generate_func(f: &Func, idl: &Idl, func_mode: FunctionMode) {
         }
     }
 
-    for (i, arg) in f.args.iter().enumerate() {
-        // skip first arg in Handle mode
-        if func_mode == FunctionMode::Handle && i == 0 {
-            continue;
-        }
-        let arg_name = arg.name_line.text.to_case(Case::Snake);
-        if i == arg_count - 1 {
-            call_args.push_str(&arg_name);
-            print!("{}: {}", arg_name, get_rust_type(&arg.arg_type, idl, true))
-        } else {
-            call_args.push_str(&arg_name);
-            call_args.push_str(", ");
-            print!("{}: {}, ", arg_name, get_rust_type(&arg.arg_type, idl, true))
-        }
-    }
+    let fa = get_func_call_args(f, &func_name, idl, func_mode);
+
+    print_args(&fa.func_args);
 
     println!(") {{");
-
-    match func_mode {
-        FunctionMode::Method => {
-            println!(
-                "       {{ bgfx_sys::{}(self as *const c_void, {}) }}",
-                ffi_name, call_args
-            );
-            println!("    }}\n");
-        }
-
-        FunctionMode::Handle => {
-            println!("       {{ bgfx_sys::{}({}) }}", ffi_name, call_args);
-            println!("    }}\n");
-        }
-
-        FunctionMode::Global => {
-            println!(
-                "    unsafe {{ bgfx_sys::{}({}) }}",
-                ffi_name, call_args
-            );
-            println!("}}\n");
-        }
+    if !fa.body.is_empty() {
+        println!("{}", fa.body);
     }
+
+    print!("unsafe {{ bgfx_sys::{}(", ffi_name);
+    print_args(&fa.ffi_args);
+    println!("); }}\n}}");
 }
 
 fn generate_funcs_for_struct(name: &str, idl: &Idl) {
@@ -362,7 +595,9 @@ fn generate_handle_impl(idl: &Idl) {
                 continue;
             }
 
-            if (!f.args.is_empty() && &f.args[0].type_name == h_type) || &f.return_name_line.text == h_type {
+            if (!f.args.is_empty() && &f.args[0].type_name == h_type)
+                || &f.return_name_line.text == h_type
+            {
                 generate_func(f, idl, FunctionMode::Handle);
             }
         }
@@ -371,20 +606,94 @@ fn generate_handle_impl(idl: &Idl) {
     }
 }
 
+fn generate_def_func_args(lookup: &mut HashMap<String, u32>, f: &Func, idl: &Idl) {
+    // check if we have default args for the function
+    let arg_count = count_default_angs(f);
+
+    // generate default args
+    if arg_count <= 1 {
+        return;
+    }
+
+    let func_name = get_func_name(f);
+
+    match lookup.get(&func_name) {
+        Some(count) => {
+            assert!(*count == arg_count);
+            return;
+        }
+        _ => (),
+    }
+
+    generate_default_params(f, &func_name, idl);
+
+    lookup.insert(func_name, arg_count);
+}
+
+// generate the structs for the default arguments
+fn generate_default_arg_structs(idl: &Idl) {
+    let mut lookup = HashMap::with_capacity(256);
+
+    for f in &idl.funcs {
+        generate_def_func_args(&mut lookup, &f, idl);
+    }
+}
+
+// Generate enums
+fn generate_enum(f: &Flag) {
+    generate_rust_comment(&f.comments);
+
+    println!("#[repr(u32)]");
+    println!("#[derive(Clone, Copy, PartialEq, Debug)]");
+    println!("enum {} {{", f.name.text);
+
+    for e in &f.entries {
+        if !e.name_line.comment.is_empty() {
+            print!("    ///{}",e.name_line.comment);
+        }
+        println!("    {},",e.name_line.text);
+    }
+
+    println!("    /// Number of entries in the enum");
+    println!("    Count,");
+
+    println!("}}\n");
+}
+
+// Generate enums
+fn generate_bitflags(f: &Flag) {
+    generate_rust_comment(&f.comments);
+
+    println!("bitflags! {{");
+    println!("    struct {}Flags : u{} {{", f.name.text, f.size);
+
+    for e in &f.entries {
+		generate_rust_comment(&e.name_line.comment);
+
+        if let Some(v) = e.value {
+        	println!("        const {} = 0x{:x},",e.name_line.text, v);
+        } else {
+        	println!("        const {} = TODO,",e.name_line.text);
+        }
+    }
+    println!("    }}");
+    println!("}}\n");
+}
+
+
 fn main() {
     let data = bgfx_idl::parse_bgfx_idl("/home/emoon/temp/foo.idl").unwrap();
 
-    /*
-    for f in &data.funcs {
-        if f.return_type.is_pointer {
-            println!("{} -> {}", f.name.text, f.return_name_line.text);
-        }
-    }
-    */
+    println!("extern crate bitflags;\n");
+
+    data.enums.iter().for_each(|e| generate_enum(e));
+    data.flags.iter().for_each(|e| generate_bitflags(e));
 
     for h in &data.handles {
         generate_handles(&h);
     }
+
+    generate_default_arg_structs(&data);
 
     for s in &data.structs {
         generate_struct(&s, &data);
@@ -402,7 +711,6 @@ fn main() {
         }
     }
 
-
     println!("{}", MANUAL_IMPL);
 
     //generate_funcs_for_struct("VertexLayout", &data);
@@ -410,6 +718,9 @@ fn main() {
 
 // for various reasons here is a list of manual implementations for some functions
 static MANUAL_IMPL: &str = "
+
+type ViewId = u16;
+
 /// Returns the number of uniforms and uniform handles used inside a shader.
 ///
 /// Notice that only non-predefined uniforms are returned.
@@ -449,7 +760,7 @@ impl Memory {
     /// of the program and is only really recommended for static data unless you know you know
     /// what you are doing. Thus this function is marked as unsafe because of this reason.
     #[inline]
-    pub fn unsafe reference<T>(data: &[T]) -> Memory {
+    pub unsafe fn reference<T>(data: &[T]) -> Memory {
         let data = bgfx_sys::bgfx_make_ref(data.as_ptr() as *const c_void,
                                            mem::size_of_val(data) as u32);
         Memory { data }
