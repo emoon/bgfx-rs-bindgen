@@ -4,9 +4,116 @@ use std::collections::HashMap;
 
 // list of functions to skip that are manually implemented
 static SKIP_FUNCS: &[&str] = &["getShaderUniforms"];
+static SKIP_STRUCTS: &[&str] = &["Memory"];
 
-fn generate_rust_comment(text: &str) {
-    text.lines().for_each(|l| println!("///{}", l));
+/// Used for replacing BGFX_<NAME>_<NAME> comments and default values
+#[derive(Default, Debug)]
+struct ReplaceFlagsEnums {
+	/// like BGFX_CAPS_, Caps
+	flags: Vec<(String, String)>,
+	/// like BGFX_CAPS_, Caps
+	enums: Vec<(String, String)>,
+}
+
+
+fn patch_string(input: &str, replace_data: &ReplaceFlagsEnums) -> Option<String> {
+	if (input.find("`BGFX").is_none() && input.find("::Enum").is_none())
+		|| input.find("BGFX_CONFIG_MULTITHREADED").is_some()
+		|| input.find("BGFX_CONFIG_MAX_BONES").is_some() {
+		return None;
+	}
+
+	let mut output = input.to_owned();
+	let mut max_loop_count = 0;
+
+	loop {
+		for t in &replace_data.enums {
+			if output.contains(&t.1) {
+				output = output.replace(&format!("`{}::Enum`", t.1), &format!("[{}]", t.1));
+			}
+		}
+
+		for t in &replace_data.flags {
+			if output.contains(&t.0) {
+				output = output.replace(&format!("`{}*`", t.0), &format!("[{}Flags]", t.1));
+				output = output.replace(&format!("`{}", t.0), &format!("[{}Flags::", t.1));
+			}
+		}
+
+		if output.find("BGFX").is_none() {
+			break;
+		}
+
+		if max_loop_count >= 4 {
+			panic!("Unable to get rid of BGFX_* in {}", output);
+		}
+
+		max_loop_count += 1;
+	}
+
+	output = output.replace('`', "]");
+
+	Some(output)
+}
+
+fn patch_string_default(input: &str, replace_data: &ReplaceFlagsEnums) -> Option<String> {
+	if (input.find("BGFX").is_none() && input.find("::Enum").is_none())
+		|| input.find("BGFX_CONFIG_MULTITHREADED").is_some()
+		|| input.find("BGFX_CONFIG_MAX_BONES").is_some() {
+		return None;
+	}
+
+	let mut output = input.to_owned();
+	let mut max_loop_count = 0;
+
+	loop {
+		for t in &replace_data.enums {
+			if output.contains(&t.0) {
+				output = output.replace(&t.0, &format!("{} as _", t.1));
+			}
+		}
+
+		for t in &replace_data.flags {
+			if output.contains(&t.0) {
+				output = output.replace(&t.0, &format!("{}Flags::", t.1));
+			}
+		}
+
+		if output.find("BGFX").is_none() {
+			break;
+		}
+
+		if max_loop_count >= 4 {
+			panic!("Unable to get rid of BGFX_* in {}", output);
+		}
+
+		max_loop_count += 1;
+	}
+
+	output = output.replace('`', "]");
+
+	Some(output)
+}
+
+
+fn generate_rust_comment(text: &str, replace_data: &ReplaceFlagsEnums) {
+    for line in text.lines() {
+    	if let Some(replace) = patch_string(&line, replace_data) {
+    		println!("///{}", replace);
+    	} else {
+    		println!("///{}", line);
+    	}
+    }
+}
+
+fn generate_rust_comment_bitflags(text: &str, replace_data: &ReplaceFlagsEnums) {
+    for line in text.lines() {
+    	if let Some(replace) = patch_string(&line, replace_data) {
+    		println!("        ///{}", replace);
+    	} else {
+    		println!("        ///{}", line);
+    	}
+    }
 }
 
 /// Get default value for a table
@@ -69,7 +176,7 @@ fn get_enum_count(name: &str, idl: &Idl) -> usize {
 
 fn get_rust_primitive_type(s: &str) -> Option<&'static str> {
     match s {
-        "char" => Some("s8"),
+        "char" => Some("i8"),
         "bool" => Some("bool"),
         "uint8_t" => Some("u8"),
         "uint16_t" => Some("u16"),
@@ -137,7 +244,12 @@ fn get_rust_type(s: &Type, idl: &Idl, is_arg: bool) -> String {
         }
 
         VarType::Struct(name) => {
-            output_type.push_str(&name);
+        	// Special case Memory as we do it by value and not by ref/pointer
+        	if name == "Memory" {
+				output_type = "Memory".to_owned();
+        	} else {
+            	output_type.push_str(&name);
+        	}
             output_type
         }
 
@@ -152,14 +264,24 @@ fn get_rust_type(s: &Type, idl: &Idl, is_arg: bool) -> String {
     }
 }
 
-fn generate_struct(s: &Func, idl: &Idl) {
-    generate_rust_comment(&s.comments);
+// This is used to patch comments/text such as:
+// `BGFX_STATE_BLEND_*` to [StateBlendFlags] (comment)
+// `BGFX_CAPS_ATTRIBUTE` to [CapsFlags::ATTRBITUE] (comment)
+// `BGFX_CAPS_ATTRIBUTE` to CapsFlags::ATTRBITUE.bits() (default value)
+//fn patch_comment_const
+
+fn generate_struct(s: &Func, idl: &Idl, replace_data: &ReplaceFlagsEnums) {
+    if SKIP_STRUCTS.iter().find(|n| *n == &s.name.text).is_some() {
+        return;
+    }
+
+    generate_rust_comment(&s.comments, replace_data);
 
     println!("#[repr(C)]");
     println!("struct {} {{", s.name.text);
 
     for e in &s.args {
-        generate_rust_comment(&e.name_line.comment);
+        generate_rust_comment(&e.name_line.comment, replace_data);
         println!(
             "    {}: {},",
             e.name_line.text.to_case(Case::Snake),
@@ -178,11 +300,9 @@ fn generate_set_name_func(f: &Func, real_name: &str) -> bool {
         return false;
     }
 
-    let handle_type = &f.args[0].type_name;
-
     println!("    pub fn {}(&self, name: &str) {{", real_name);
     println!(
-        "        unsafe {{ bgfx_sys::{}(self.handle, name.ptr(), name.len() as i32) }}",
+        "        unsafe {{ bgfx_sys::bgfx_{}(self.handle, name.ptr(), name.len() as i32) }}",
         real_name
     );
     println!("    }}");
@@ -199,7 +319,31 @@ enum FunctionMode {
 }
 
 fn get_snake_name(name: &str) -> String {
-    let mut name = name.to_case(Case::Snake);
+	let mut output = String::with_capacity(256);
+	let mut prev = '_';
+
+	for c in name.chars() {
+		if c.is_ascii_uppercase() {
+			let mut t = c;
+			t.make_ascii_lowercase();
+
+			if !prev.is_numeric() && prev != '_' {
+				output.push('_');
+			}
+
+			output.push(t);
+		} else {
+			if c.is_numeric() && prev != '_' {
+				output.push('_');
+			}
+			output.push(c);
+		}
+
+		prev = c;
+	}
+
+    //let mut name = name.to_case(Case::Snake);
+    /*
     // special case: 2D gets translated to 2_d and we want 2d
 
     let len = name.len();
@@ -216,17 +360,27 @@ fn get_snake_name(name: &str) -> String {
     if remove_incorrect_space {
         name.remove(len - 2);
     }
+    */
 
-    name
+    output
 }
 
 fn get_ffi_call_name(f: &Func) -> String {
     let mut name = String::with_capacity(256);
+	let func_name = get_func_name(f);
 
     name.push_str("bgfx_");
-    name.push_str(&f.class.text);
-    name.push_str(&f.name.text);
+    if !f.class.text.is_empty() {
+    	let mut t = format!("{}_", &f.class.text);
 
+    	if t == "VertexLayoutBuilder_" {
+    		t = "VertexLayout_".to_owned();
+    	}
+
+    	name.push_str(&t);
+    }
+
+    name.push_str(&func_name);
     get_snake_name(&name)
 }
 
@@ -248,7 +402,7 @@ fn get_ffi_call_name(f: &Func) -> String {
 /// ffi call:  format.handle
 /// ----------------------------------------------------------------------------
 /// input: .mem "const Memory*" { default = NULL }
-/// args:      format: Optional<&Memory>
+/// args:      format: Optional<Memory>
 /// body:      let _mem = if let Some(f) = format { f.handle } else { null() };
 /// ffi call:  _mem
 /// ----------------------------------------------------------------------------
@@ -453,17 +607,17 @@ fn print_args(args: &Vec<String>) {
 }
 
 /// Generate default parameter struct
-fn generate_default_params(f: &Func, name: &str, idl: &Idl) {
+fn generate_default_params(f: &Func, name: &str, idl: &Idl, replace_data: &ReplaceFlagsEnums) {
     let name = format!("{}Args", name.to_case(Case::UpperCamel));
 
     println!("struct {} {{", name);
 
-    let mut default_args = Vec::new();
+    let mut default_args = Vec::with_capacity(f.args.len());
 
     for e in &f.args {
         // get the default argument
         if let Some(da) = get_default_arg(&e.table) {
-            generate_rust_comment(&e.name_line.comment);
+            generate_rust_comment(&e.name_line.comment, replace_data);
             let arg_name = e.name_line.text.to_case(Case::Snake);
             let rust_type = get_rust_type(&e.arg_type, idl, true);
 
@@ -473,7 +627,11 @@ fn generate_default_params(f: &Func, name: &str, idl: &Idl) {
                 println!("pub {}: {},", arg_name, rust_type);
             }
 
-            default_args.push((arg_name, da));
+			if let Some(p) = patch_string_default(&da, replace_data) {
+            	default_args.push((arg_name, p));
+			} else {
+            	default_args.push((arg_name, da));
+			}
         }
     }
 
@@ -491,7 +649,7 @@ fn generate_default_params(f: &Func, name: &str, idl: &Idl) {
 }
 
 /// General function implementation
-fn generate_func(f: &Func, idl: &Idl, func_mode: FunctionMode) {
+fn generate_func(f: &Func, idl: &Idl, func_mode: FunctionMode, replace_data: &ReplaceFlagsEnums) {
     // if function has been marked for skipping we skip it
     if SKIP_FUNCS.iter().find(|n| *n == &f.name.text).is_some() {
         return;
@@ -499,12 +657,14 @@ fn generate_func(f: &Func, idl: &Idl, func_mode: FunctionMode) {
 
     let func_name = get_func_name(f);
 
-    generate_rust_comment(&f.comments);
+    generate_rust_comment(&f.comments, replace_data);
 
-    // generate check name function if it is one
-    if generate_set_name_func(f, &func_name) {
-        return;
-    }
+	if func_mode == FunctionMode::Method {
+		// generate check name function if it is one
+		if generate_set_name_func(f, &func_name) {
+			return;
+		}
+	}
 
     let arg_count = f.args.len();
 
@@ -549,7 +709,7 @@ fn generate_func(f: &Func, idl: &Idl, func_mode: FunctionMode) {
     println!("); }}\n}}");
 }
 
-fn generate_funcs_for_struct(name: &str, idl: &Idl) {
+fn generate_funcs_for_struct(name: &str, idl: &Idl, replace_data: &ReplaceFlagsEnums) {
     println!("impl {} {{", name);
     println!("    pub fn new() -> {} {{", name);
     println!("        let t = MaybeUninit::<{}>::zeroed();", name);
@@ -559,7 +719,7 @@ fn generate_funcs_for_struct(name: &str, idl: &Idl) {
 
     for f in &idl.funcs {
         if f.class.text == name {
-            generate_func(f, idl, FunctionMode::Method);
+            generate_func(f, idl, FunctionMode::Method, replace_data);
         }
     }
 
@@ -582,7 +742,7 @@ fn generate_handles(h: &Typedef) {
 }
 
 // generates implementations for the handle structs
-fn generate_handle_impl(idl: &Idl) {
+fn generate_handle_impl(idl: &Idl, replace_data: &ReplaceFlagsEnums) {
     for h in &idl.handles {
         let h_type = &h.type_line.text;
         let len = h_type.len() - 6;
@@ -598,7 +758,7 @@ fn generate_handle_impl(idl: &Idl) {
             if (!f.args.is_empty() && &f.args[0].type_name == h_type)
                 || &f.return_name_line.text == h_type
             {
-                generate_func(f, idl, FunctionMode::Handle);
+                generate_func(f, idl, FunctionMode::Handle, replace_data);
             }
         }
 
@@ -606,7 +766,7 @@ fn generate_handle_impl(idl: &Idl) {
     }
 }
 
-fn generate_def_func_args(lookup: &mut HashMap<String, u32>, f: &Func, idl: &Idl) {
+fn generate_def_func_args(lookup: &mut HashMap<String, u32>, f: &Func, idl: &Idl, replace_data: &ReplaceFlagsEnums) {
     // check if we have default args for the function
     let arg_count = count_default_angs(f);
 
@@ -625,23 +785,23 @@ fn generate_def_func_args(lookup: &mut HashMap<String, u32>, f: &Func, idl: &Idl
         _ => (),
     }
 
-    generate_default_params(f, &func_name, idl);
+    generate_default_params(f, &func_name, idl, replace_data);
 
     lookup.insert(func_name, arg_count);
 }
 
 // generate the structs for the default arguments
-fn generate_default_arg_structs(idl: &Idl) {
+fn generate_default_arg_structs(idl: &Idl, replace_data: &ReplaceFlagsEnums) {
     let mut lookup = HashMap::with_capacity(256);
 
     for f in &idl.funcs {
-        generate_def_func_args(&mut lookup, &f, idl);
+        generate_def_func_args(&mut lookup, &f, idl, replace_data);
     }
 }
 
 // Generate enums
-fn generate_enum(f: &Flag) {
-    generate_rust_comment(&f.comments);
+fn generate_enum(f: &Flag, replace_data: &ReplaceFlagsEnums) {
+    generate_rust_comment(&f.comments, replace_data);
 
     println!("#[repr(u32)]");
     println!("#[derive(Clone, Copy, PartialEq, Debug)]");
@@ -661,53 +821,93 @@ fn generate_enum(f: &Flag) {
 }
 
 // Generate enums
-fn generate_bitflags(f: &Flag) {
-    generate_rust_comment(&f.comments);
+fn generate_bitflags(f: &Flag, replace_data: &ReplaceFlagsEnums) {
 
     println!("bitflags! {{");
+    generate_rust_comment(&f.comments, replace_data);
     println!("    struct {}Flags : u{} {{", f.name.text, f.size);
 
     for e in &f.entries {
-		generate_rust_comment(&e.name_line.comment);
+		generate_rust_comment_bitflags(&e.name_line.comment, replace_data);
 
         if let Some(v) = e.value {
-        	println!("        const {} = 0x{:x},",e.name_line.text, v);
+        	println!("        const {} = 0x{:x};",e.name_line.text.to_case(Case::UpperSnake), v);
         } else {
-        	println!("        const {} = TODO,",e.name_line.text);
+        	print!("        const {} = ",e.name_line.text.to_case(Case::UpperSnake));
+        	let table = e.table.as_ref().unwrap();
+        	let len = table.len();
+
+        	for (c, t) in table.iter().enumerate() {
+        		if c != len - 1 {
+        			print!("Self::{}.bits | ", t.name.to_case(Case::UpperSnake));
+        		} else {
+        			print!("Self::{}.bits;", t.name.to_case(Case::UpperSnake));
+        		}
+        	}
+
+			println!("");
         }
     }
     println!("    }}");
     println!("}}\n");
 }
 
+// Returns two arrays
+fn get_flags_enums_replace_args(idl: &Idl) -> ReplaceFlagsEnums {
+	let mut output = ReplaceFlagsEnums::default();
+
+	for e in &idl.enums {
+		let bgfx_name = format!("BGFX_{}_", e.name.text.to_case(Case::UpperSnake));
+		output.enums.push((bgfx_name, e.name.text.to_owned()));
+	}
+
+	output.enums.sort();
+
+	for e in &idl.flags {
+		let bgfx_name = format!("BGFX_{}_", e.name.text.to_case(Case::UpperSnake));
+		output.flags.push((bgfx_name, e.name.text.to_owned()));
+	}
+
+	// sort so the longest names are first as the replacement won't work corretly otherwise
+	output.enums.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+	output.flags.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
+	output
+}
+
 
 fn main() {
-    let data = bgfx_idl::parse_bgfx_idl("/home/emoon/temp/foo.idl").unwrap();
+    let mut data = bgfx_idl::parse_bgfx_idl("/home/emoon/temp/foo.idl").unwrap();
 
-    println!("extern crate bitflags;\n");
+	println!("#[macro_use]");
+	println!("extern crate bitflags;\n");
+	println!("use std::mem::MaybeUninit;");
+	println!("use core::ffi::c_void;\n");
 
-    data.enums.iter().for_each(|e| generate_enum(e));
-    data.flags.iter().for_each(|e| generate_bitflags(e));
+	let replace_data = get_flags_enums_replace_args(&data);
+
+    data.enums.iter().for_each(|e| generate_enum(e, &replace_data));
+    data.flags.iter().for_each(|e| generate_bitflags(e, &replace_data));
 
     for h in &data.handles {
         generate_handles(&h);
     }
 
-    generate_default_arg_structs(&data);
+    generate_default_arg_structs(&data, &replace_data);
 
     for s in &data.structs {
-        generate_struct(&s, &data);
+        generate_struct(&s, &data, &replace_data);
     }
 
-    generate_handle_impl(&data);
+    generate_handle_impl(&data, &replace_data);
 
     for s in &data.structs {
-        generate_funcs_for_struct(&s.name.text, &data);
+        generate_funcs_for_struct(&s.name.text, &data, &replace_data);
     }
 
     for f in &data.funcs {
         if f.class.text.is_empty() {
-            generate_func(&f, &data, FunctionMode::Global);
+            generate_func(&f, &data, FunctionMode::Global, &replace_data);
         }
     }
 
@@ -735,8 +935,9 @@ pub fn get_shader_uniforms(handle: ShaderHandle, uniforms: &mut [UniformHandle])
 ///
 /// [`copy(...)`]: #method.copy
 /// [`reference(...)`]: #method.reference
+#[derive(Copy, Clone)]
 pub struct Memory {
-    data: *const bgfx_sys::bgfx_memory_t,
+    handle: *const bgfx_sys::bgfx_memory_t,
 }
 
 impl Memory {
@@ -747,9 +948,9 @@ impl Memory {
     #[inline]
     pub fn copy<T>(data: &[T]) -> Memory {
         unsafe {
-            let data = bgfx_sys::bgfx_copy(data.as_ptr() as *const c_void,
-                                           mem::size_of_val(data) as u32);
-            Memory { data }
+            let handle = bgfx_sys::bgfx_copy(data.as_ptr() as *const c_void,
+                                           std::mem::size_of_val(data) as u32);
+            Memory { handle }
         }
     }
 
@@ -761,9 +962,9 @@ impl Memory {
     /// what you are doing. Thus this function is marked as unsafe because of this reason.
     #[inline]
     pub unsafe fn reference<T>(data: &[T]) -> Memory {
-        let data = bgfx_sys::bgfx_make_ref(data.as_ptr() as *const c_void,
-                                           mem::size_of_val(data) as u32);
-        Memory { data }
+        let handle = bgfx_sys::bgfx_make_ref(data.as_ptr() as *const c_void,
+                                           std::mem::size_of_val(data) as u32);
+        Memory { handle }
     }
 }
 
