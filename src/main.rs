@@ -71,7 +71,8 @@ fn patch_string(input: &str, replace_data: &ReplaceFlagsEnums) -> Option<String>
         }
 
         if max_loop_count >= 4 {
-            panic!("Unable to get rid of BGFX_* in {}", output);
+        	break;
+            //panic!("Unable to get rid of BGFX_* in {}", output);
         }
 
         max_loop_count += 1;
@@ -785,7 +786,38 @@ fn generate_func(f: &Func, idl: &Idl, func_mode: FunctionMode, replace_data: &Re
 
     let func_name = get_func_name(f).0;
 
-    generate_rust_comment(&f.comments, replace_data);
+
+    for a in &f.args {
+		print!("/// * `{}`:", a.name_line.text.to_case(Case::Snake));
+		let mut skip_first_com = true;
+
+		for line in a.name_line.text.lines().skip(1) {
+			if let Some(replace) = patch_string(&line, replace_data) {
+				if skip_first_com {
+					println!(" {}", replace);
+					skip_first_com = false;
+				} else {
+					println!("///{}", replace);
+				}
+			} else {
+				if skip_first_com {
+					println!(" {}", line);
+					skip_first_com = false;
+				} else {
+					println!("///{}", line);
+				}
+			}
+		}
+
+		println!("");
+
+    	generate_rust_comment(&a.name_line.comment, replace_data);
+    	/*
+    	for line in a.name_line.comment.lines() {
+    		println!("///{}", line);
+    	}
+    	*/
+    }
 
     if func_mode == FunctionMode::Handle {
         // generate check name function if it is one
@@ -793,7 +825,7 @@ fn generate_func(f: &Func, idl: &Idl, func_mode: FunctionMode, replace_data: &Re
             return;
         }
     } else {
-        if func_name.contains("set_name") {
+        if func_name.contains("_name") {
             return;
         }
     }
