@@ -4,29 +4,31 @@ use std::collections::HashMap;
 
 // list of functions to skip that are manually implemented
 static SKIP_FUNCS: &[&str] = &[
-    "getShaderUniforms",
-    "setViewOrder",
-    "alloc",
-    "copy",
-    "makeRef",
-    "vertexUnpack",
-    "overrideInternal",
-    "dbgTextPrintf",
-    "dbgTextPrintfVargs",
-    "readTexture",
-    "decode",
-    "pack",
-    "convert",
-    "vertexPack",
-    "vertexConvert",
-    "weldVertices",
-	"topologyConvert",
-	"topologySortTriList",
-    "VertexLayout.decode",
-    "VertexLayout.pack",
-    "VertexLayout.convert",
+	"getDirectAccessPtr",
+	"getRendererName",
 	"getSupportedRenderers",
 	"setPaletteColor",
+	"topologyConvert",
+	"topologySortTriList",
+    "VertexLayout.convert",
+    "VertexLayout.decode",
+    "VertexLayout.pack",
+    "alloc",
+    "convert",
+    "copy",
+    "dbgTextPrintf",
+    "dbgTextPrintfVargs",
+    "decode",
+    "getShaderUniforms",
+    "makeRef",
+    "overrideInternal",
+    "pack",
+    "readTexture",
+    "setViewOrder",
+    "vertexConvert",
+    "vertexPack",
+    "vertexUnpack",
+    "weldVertices",
 ];
 static SKIP_STRUCTS: &[&str] = &["Memory"];
 
@@ -535,6 +537,8 @@ struct FuncArgs {
     func_args: Vec<String>,
     ffi_args: Vec<String>,
     body: String,
+    post_call: String,
+    ret_value: String,
 }
 
 /// Generate the function setup when there are default arguments
@@ -609,6 +613,48 @@ fn get_func_call_args(f: &Func, func_name: &str, idl: &Idl, func_mode: FunctionM
 
 		_ => (),
     }
+
+	// setup return value
+	// TODO: Reduce code?
+
+	match &f.return_type.var_type {
+		VarType::Primitive(name) => {
+			fa.ret_value = get_rust_primitive_type(&name).unwrap().to_owned();
+			fa.post_call = "_ret".to_owned();
+		}
+
+		VarType::Struct(name) => {
+			// Translate *Handle to *
+			if let Some((handle_name, _)) = name.rsplit_once("Handle") {
+				fa.ret_value = handle_name.to_owned();
+				fa.post_call = format!("{} {{ handle: _ret }}", handle_name);
+			} else if name == "VertexLayoutBuilder" {
+				// special case vertex layout builder
+				fa.ret_value = "&Self".to_owned();
+				fa.post_call = "self".to_owned();
+			} else {
+				if f.return_type.is_pointer || f.return_type.is_ref {
+					fa.ret_value = format!("&'static {}", name);
+				} else {
+					fa.ret_value = name.to_owned();
+				}
+
+				fa.post_call = "std::mem::transmute(_ret)".to_owned();
+			}
+		}
+
+		VarType::Enum(name) => {
+			fa.ret_value = name.to_owned();
+			fa.post_call = "std::mem::transmute(_ret)".to_owned();
+		}
+
+		VarType::Array(type_name, count) => {
+			fa.ret_value = get_rust_array(&type_name, &count, idl).to_owned();
+			fa.post_call = "std::mem::transmute(_ret)".to_owned();
+		}
+
+		_ => (),
+	}
 
     let arg_count = count_default_angs(f);
 
@@ -785,16 +831,32 @@ fn generate_func(f: &Func, idl: &Idl, func_mode: FunctionMode, replace_data: &Re
 
     print_args(&fa.func_args);
 
-    println!(") {{");
+    if !fa.ret_value.is_empty() {
+    	println!(") -> {} {{", fa.ret_value);
+    } else {
+    	println!(") {{");
+    }
+
     println!("unsafe {{");
 
     if !fa.body.is_empty() {
         println!("{}", fa.body);
     }
 
-    print!("bgfx_sys::{}(", ffi_name);
+    if let VarType::Unknown(_) = f.return_type.var_type {
+    	print!("bgfx_sys::{}(", ffi_name);
+    } else {
+    	print!("let _ret = bgfx_sys::{}(", ffi_name);
+    }
+
     print_args(&fa.ffi_args);
-    println!("); }}\n}}");
+    println!(");");
+
+    if !fa.post_call.is_empty() {
+    	println!("{}", fa.post_call);
+    }
+
+    println!("}}\n}}");
 }
 
 fn generate_funcs_for_struct(name: &str, idl: &Idl, replace_data: &ReplaceFlagsEnums) {
