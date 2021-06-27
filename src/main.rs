@@ -29,6 +29,8 @@ static SKIP_FUNCS: &[&str] = &[
     "vertexPack",
     "vertexUnpack",
     "weldVertices",
+    "setViewTransform",
+    "setTransform",
 ];
 static SKIP_STRUCTS: &[&str] = &["Memory"];
 
@@ -1154,5 +1156,47 @@ impl Memory {
         Memory { handle }
     }
 }
+
+/// * `x`:
+/// Position x from the left corner of the window.
+/// * `y`:
+/// Position y from the top corner of the window.
+/// * `attr`:
+/// Color palette. Where top 4-bits represent index of background, and bottom
+/// 4-bits represent foreground color from standard VGA text palette (ANSI escape codes).
+/// * `text`: Text to be displayed
+pub fn dbg_text(x: u16, y: u16, attr: u8, text: &str) {
+    unsafe {
+    	let c_text = std::ffi::CString::new(text).unwrap();
+        bgfx_sys::bgfx_dbg_text_printf(x, y, attr, c_text.as_ptr());
+    }
+}
+
+/// * `id`:
+/// View id.
+/// * `view`:
+/// View matrix.
+/// * `proj`:
+/// Projection matrix.
+pub fn set_view_transform(id: ViewId, view: &[f32; 16], proj: &[f32; 16]) {
+    unsafe {
+    	let _view = std::mem::transmute(view);
+    	let _proj = std::mem::transmute(proj);
+        bgfx_sys::bgfx_set_view_transform(id, _view, _proj);
+    }
+}
+
+/// * `mtx`:
+/// Pointer to first matrix in array.
+/// * `num`:
+/// Number of matrices in array.
+pub fn set_transform(mtx: &[f32; 16], num: u16) -> u32 {
+    unsafe {
+    	let _mtx = std::mem::transmute(mtx);
+        bgfx_sys::bgfx_set_transform(_mtx, num)
+    }
+}
+
+//pub use crate::* as bgfx::*;
 
 ";
