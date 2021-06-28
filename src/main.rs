@@ -33,6 +33,7 @@ static SKIP_FUNCS: &[&str] = &[
     "weldVertices",
     "setViewTransform",
     "setTransform",
+    "setViewName",
 ];
 static SKIP_STRUCTS: &[&str] = &["Memory"];
 
@@ -43,6 +44,14 @@ struct ReplaceFlagsEnums {
     flags: Vec<(String, String)>,
     /// like BGFX_CAPS_, Caps
     enums: Vec<(String, String)>,
+}
+
+/// Run Rustfmt on generated file
+fn run_rustfmt(filename: &str) {
+    std::process::Command::new("rustfmt")
+        .arg(filename)
+        .output()
+        .expect("failed to execute cargo fmt");
 }
 
 fn patch_string(input: &str, replace_data: &ReplaceFlagsEnums) -> Option<String> {
@@ -919,7 +928,7 @@ fn generate_funcs_for_struct<W: Write>(w: &mut W, name: &str, idl: &Idl, replace
 fn generate_handles<W: Write>(w: &mut W, h: &Typedef) -> Result<()> {
     let len = h.type_line.text.len() - 6;
 
-    writeln!(w, "#[derive(Copy, Clone, Debug)]")?;
+    writeln!(w, "#[derive(Clone, Debug)]")?;
     writeln!(w, "pub struct {} {{ ", &h.type_line.text[..len])?;
     writeln!(w, "    handle: bgfx_sys::bgfx_{}_t,", h.type_line.text.to_case(Case::Snake))?;
     writeln!(w, "}}\n")
@@ -935,7 +944,8 @@ fn generate_handle_impl<W: Write>(w: &mut W, idl: &Idl, replace_data: &ReplaceFl
 
         // find matching handle name for the first argument
         for f in &idl.funcs {
-            if !f.class.text.is_empty() {
+        	// destroy will be handled in the next loop
+            if !f.class.text.is_empty() || f.name.text == "destroy" {
                 continue;
             }
 
@@ -947,6 +957,19 @@ fn generate_handle_impl<W: Write>(w: &mut W, idl: &Idl, replace_data: &ReplaceFl
         }
 
         writeln!(w, "}}\n")?;
+
+		// generate Drop if there is one for the type
+        for f in &idl.funcs {
+            if f.name.text != "destroy" || &f.args[0].type_name != h_type {
+                continue;
+            }
+
+			let func_name = get_func_name(&f).0;
+
+			writeln!(w, "impl Drop for {} {{", &h_type[..len])?;
+			writeln!(w, "fn drop(&mut self) {{")?;
+			writeln!(w, "unsafe {{ bgfx_sys::bgfx_{}(self.handle); }}}}}}\n", func_name)?;
+        }
     }
 
     Ok(())
@@ -1115,8 +1138,14 @@ fn output_wrapper<W: Write>(w: &mut W, data: &Idl) -> Result<()> {
 fn main() {
     let data = bgfx_idl::parse_bgfx_idl("/home/emoon/temp/foo.idl").unwrap();
 
-	let mut regular_output = BufWriter::new(File::create("/home/emoon/temp/output.rs").unwrap());
-	output_wrapper(&mut regular_output, &data).unwrap();
+    let regular_filename = "/home/emoon/code/projects/bgfx-rs/src/lib.rs";
+
+	{
+		let mut regular_output = BufWriter::new(File::create(&regular_filename).unwrap());
+		output_wrapper(&mut regular_output, &data).unwrap();
+	}
+
+	run_rustfmt(&regular_filename);
 
     //generate_funcs_for_struct("VertexLayout", &data);
 }
