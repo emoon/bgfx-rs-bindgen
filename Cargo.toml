@@ -13,3 +13,6 @@ convert_case = "0.4.0"
 [[bin]]
 name = "gen"
 path = "src/main.rs"
+
+[features]
+plugin-api = []

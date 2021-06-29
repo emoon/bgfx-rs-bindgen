@@ -1152,8 +1152,6 @@ fn get_flags_enums_replace_args(idl: &Idl) -> ReplaceFlagsEnums {
 }
 
 fn output_wrapper<W: Write>(w: &mut W, data: &Idl) -> Result<()> {
-    writeln!(w, "#[macro_use]")?;
-    writeln!(w, "extern crate bitflags;\n")?;
     writeln!(w, "use std::mem::MaybeUninit;")?;
     writeln!(w, "use core::ffi::c_void;\n")?;
 
@@ -1192,17 +1190,60 @@ fn output_wrapper<W: Write>(w: &mut W, data: &Idl) -> Result<()> {
     writeln!(w, "{}", MANUAL_IMPL)
 }
 
+// takes the static input file and patches it up with the dynamic calls
+fn write_shared_api_file<W: Write>(w: &mut W, static_lib: &str) -> Result<()> {
+	let mut header = false;
+
+	for line in static_lib.lines() {
+		if line.is_empty() && !header {
+			writeln!(w, "STATIC g_vtbl: *const bgfx_sys::bgfx_interface_vtbl_t = std::ptr::null();\n")?;
+			writeln!(w, "pub fn set_interface(face: *const bgfx_sys::bgfx_interface_vtbl_t) {{")?;
+			writeln!(w, "g_vtbl = face;")?;
+			writeln!(w, "}}")?;
+			header = true;
+		}
+
+		if !line.contains("bgfx_sys::bgfx_") || !line.contains('(') || !line.contains(')') {
+			writeln!(w, "{}", line)?;
+			continue;
+		}
+
+		// translate this style: bgfx_sys::bgfx_set_compute_index_buffer(stage, handle.handle, access as _);
+		// to (*g_vtbl.bgfx_set_compute_index_buffer).unwrap()(stage, handle.handle, access as _);
+
+		let start_func_name = line.find("::").unwrap() + 2;
+		let end = line.find('(').unwrap();
+		let func_name = &line[start_func_name..end];
+		let new_name = format!("(*g_vtbl.{}).unwrap()", func_name);
+		let replace_name = format!("bgfx_sys::{}", func_name);
+		let new_line = line.replace(&replace_name, &new_name);
+
+		writeln!(w, "{}", new_line)?;
+	}
+
+	Ok(())
+}
+
 fn main() {
     let data = bgfx_idl::parse_bgfx_idl("/home/emoon/temp/foo.idl").unwrap();
 
-    let regular_filename = "/home/emoon/code/projects/bgfx-rs/src/lib.rs";
+    let static_filename = "/home/emoon/code/projects/bgfx-rs/src/static_lib.rs";
+    let shared_filename = "/home/emoon/code/projects/bgfx-rs/src/shared_lib.rs";
 
     {
-        let mut regular_output = BufWriter::new(File::create(&regular_filename).unwrap());
+        let mut regular_output = BufWriter::new(File::create(&static_filename).unwrap());
         output_wrapper(&mut regular_output, &data).unwrap();
     }
 
-    run_rustfmt(&regular_filename);
+    run_rustfmt(&static_filename);
+
+    {
+    	let t = std::fs::read_to_string(static_filename).unwrap();
+        let mut output = BufWriter::new(File::create(&shared_filename).unwrap());
+        write_shared_api_file(&mut output, &t).unwrap();
+    }
+
+    run_rustfmt(&shared_filename);
 
     //generate_funcs_for_struct("VertexLayout", &data);
 }
@@ -1301,7 +1342,5 @@ pub fn set_transform(mtx: &[f32; 16], num: u16) -> u32 {
         bgfx_sys::bgfx_set_transform(_mtx, num)
     }
 }
-
-//pub use crate::* as bgfx::*;
 
 ";
