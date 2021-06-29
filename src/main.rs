@@ -34,6 +34,7 @@ static SKIP_FUNCS: &[&str] = &[
     "setViewTransform",
     "setTransform",
     "setViewName",
+    "initCtor",
 ];
 static SKIP_STRUCTS: &[&str] = &["Memory"];
 
@@ -940,6 +941,14 @@ fn generate_funcs_for_struct<W: Write>(
     writeln!(w, "    pub fn new() -> {} {{", name)?;
     writeln!(w, "        let t = MaybeUninit::<{}>::zeroed();", name)?;
     writeln!(w, "        let t = unsafe {{ t.assume_init() }};")?;
+
+    // special case for bgfx_init_ctor
+    if name == "Init" {
+    	writeln!(w, "unsafe {{")?;
+        writeln!(w, "let _init = std::mem::transmute(&t);")?;
+        writeln!(w, "bgfx_sys::bgfx_init_ctor(_init); }}")?;
+    }
+
     writeln!(w, "        t")?;
     writeln!(w, "    }}\n")?;
 
